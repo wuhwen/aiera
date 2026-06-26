@@ -1,0 +1,158 @@
+x-api-env: &api-env
+  DATABASE_URL: postgresql+psycopg://podcast:${POSTGRES_PASSWORD:-podcast-dev}@postgres:5432/podcast
+  REDIS_URL: redis://redis:6379/0
+  API_KEY: ${API_KEY:-}
+  MOCK_PROVIDERS: ${MOCK_PROVIDERS:-true}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
+  COS_BUCKET: ${COS_BUCKET:-}
+  COS_REGION: ${COS_REGION:-ap-shanghai}
+  COS_SECRET_ID: ${COS_SECRET_ID:-}
+  COS_SECRET_KEY: ${COS_SECRET_KEY:-}
+  TENCENT_ASR_APP_ID: ${TENCENT_ASR_APP_ID:-}
+  TENCENT_ASR_SECRET_ID: ${TENCENT_ASR_SECRET_ID:-}
+  TENCENT_ASR_SECRET_KEY: ${TENCENT_ASR_SECRET_KEY:-}
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+
+services:
+  nginx:
+    image: ${DOCKER_MIRROR:-m.daocloud.io/docker.io/library}/nginx:1.27-alpine
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${TLS_CERT_DIR:-./nginx/certs}:/etc/nginx/certs:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: unless-stopped
+    mem_limit: 128m
+
+  web:
+    build:
+      context: ./web
+      network: host
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-m.daocloud.io/docker.io/library/node:22-alpine}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        NEXT_PUBLIC_API_URL: /api
+        NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-${API_KEY:-}}
+    environment:
+      NEXT_PUBLIC_API_URL: /api
+      NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-${API_KEY:-}}
+      HOSTNAME: 0.0.0.0
+    expose:
+      - "3000"
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: 0.45
+
+  api:
+    build:
+      context: ./api
+      network: host
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-m.daocloud.io/docker.io/library/python:3.12-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+        APT_MIRROR: ${APT_MIRROR:-https://mirrors.cloud.tencent.com}
+    environment:
+      <<: *api-env
+    volumes:
+      - media-storage:/app/storage
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: 0.35
+
+  worker:
+    build:
+      context: ./api
+      network: host
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-m.daocloud.io/docker.io/library/python:3.12-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.cloud.tencent.com/pypi/simple}
+        APT_MIRROR: ${APT_MIRROR:-https://mirrors.cloud.tencent.com}
+    command:
+      - celery
+      - -A
+      - app.tasks:celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=1
+      - --prefetch-multiplier=1
+      - --max-tasks-per-child=8
+    environment:
+      <<: *api-env
+      TMPDIR: /work
+    volumes:
+      - worker-cache:/work
+      - media-storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 2m
+    mem_limit: 2304m
+    memswap_limit: 2560m
+    cpus: 1.0
+
+  postgres:
+    image: ${DOCKER_MIRROR:-m.daocloud.io/docker.io/library}/postgres:17-alpine
+    environment:
+      POSTGRES_DB: podcast
+      POSTGRES_USER: podcast
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-podcast-dev}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U podcast -d podcast"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 512m
+
+  redis:
+    image: ${DOCKER_MIRROR:-m.daocloud.io/docker.io/library}/redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 192m
+
+  capcut-mate:
+    profiles: ["capcut"]
+    build: ./capcut-mate
+    expose:
+      - "30000"
+    environment:
+      DOWNLOAD_FILE_SIZE_LIMIT: "2147483648"
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.5
+
+volumes:
+  postgres-data:
+  redis-data:
+  worker-cache:
+  media-storage:

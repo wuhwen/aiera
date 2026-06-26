@@ -1,0 +1,36 @@
+# Local WSL/Docker compatibility layer.
+# Production: docker compose -f docker-compose.yml up -d
+services:
+  web:
+    network_mode: host
+
+  api:
+    network_mode: host
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+    environment:
+      DATABASE_URL: postgresql+psycopg://podcast:${POSTGRES_PASSWORD:-podcast-dev}@127.0.0.1:5432/podcast
+      REDIS_URL: redis://127.0.0.1:6379/0
+
+  worker:
+    network_mode: host
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
+    environment:
+      DATABASE_URL: postgresql+psycopg://podcast:${POSTGRES_PASSWORD:-podcast-dev}@127.0.0.1:5432/podcast
+      REDIS_URL: redis://127.0.0.1:6379/0
+
+  postgres:
+    network_mode: host
+
+  redis:
+    network_mode: host
+
+  nginx:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./nginx/local.conf:/etc/nginx/conf.d/default.conf:ro
+

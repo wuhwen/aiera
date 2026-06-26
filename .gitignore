@@ -1,0 +1,10 @@
+.env
+*.db
+__pycache__/
+.pytest_cache/
+.next/
+node_modules/
+nginx/certs/
+data/
+storage/
+.codegraph/

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "frontend-design-3": {
+      "name": "Frontend Design",
+      "zip_url": "https://api.skillhub.cn/api/v1/download?slug=frontend-design-3",
+      "source": "community",
+      "version": "0.1.0",
+      "installedAt": "2026-06-12T05:10:38Z"
+    }
+  }
+}
