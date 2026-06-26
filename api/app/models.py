@@ -42,6 +42,18 @@ class Project(Base):
     jobs: Mapped[list["Job"]] = relationship(back_populates="project", cascade="all, delete-orphan")
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(80))
+    password_hash: Mapped[str] = mapped_column(String(255))
+    session_token: Mapped[str | None] = mapped_column(String(80), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class Job(Base):
     __tablename__ = "jobs"
 
@@ -103,4 +115,3 @@ class Export(Base):
     status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), default=JobStatus.exporting)
     object_key: Mapped[str | None] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-

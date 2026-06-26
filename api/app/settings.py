@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     api_key: str = ""
     cors_origins: str = "http://localhost:3000"
     mock_providers: bool = True
+    asr_provider: str = "mock"
+    whisper_model: str = "small"
+    whisper_device: str = "cpu"
+    whisper_compute_type: str = "int8"
+    whisper_language: str = "zh"
+    whisper_beam_size: int = 5
     max_upload_bytes: int = 2 * 1024 * 1024 * 1024
     max_duration_ms: int = 2 * 60 * 60 * 1000
     local_storage_dir: str = "storage"

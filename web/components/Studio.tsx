@@ -25,28 +25,33 @@ function Waveform({ active }: { active: boolean }) {
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "/api").replace(/\/$/, "");
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+const AUTH_STORAGE_KEY = "podcast-cut-auth";
 
 const apiUrl = (path: string) => `${API_BASE}${path}`;
 
-const apiHeaders = (headers?: HeadersInit): HeadersInit => ({
+const apiHeaders = (headers?: HeadersInit, token?: string): HeadersInit => ({
   ...(API_KEY ? { "X-API-Key": API_KEY } : {}),
+  ...(token ? { Authorization: `Bearer ${token}` } : {}),
   ...headers,
 });
 
-const withMediaAuth = (url: string) => {
-  if (!API_KEY || url.startsWith("blob:")) return url;
+const withMediaAuth = (url: string, token?: string) => {
+  if ((!API_KEY && !token) || url.startsWith("blob:")) return url;
   const separator = url.includes("?") ? "&" : "?";
-  return `${url}${separator}api_key=${encodeURIComponent(API_KEY)}`;
+  const params = new URLSearchParams();
+  if (API_KEY) params.set("api_key", API_KEY);
+  if (token) params.set("session_token", token);
+  return `${url}${separator}${params.toString()}`;
 };
 
-const mediaUrl = (path: string) => {
+const mediaUrl = (path: string, token?: string) => {
   if (path.startsWith("blob:") || path.startsWith("http://") || path.startsWith("https://")) {
-    return withMediaAuth(path);
+    return withMediaAuth(path, token);
   }
   if (API_BASE.startsWith("http://") || API_BASE.startsWith("https://")) {
-    return withMediaAuth(`${new URL(API_BASE).origin}${path}`);
+    return withMediaAuth(`${new URL(API_BASE).origin}${path}`, token);
   }
-  return withMediaAuth(path);
+  return withMediaAuth(path, token);
 };
 
 const readDuration = (url: string) =>
@@ -58,23 +63,87 @@ const readDuration = (url: string) =>
     audio.onerror = () => resolve(null);
   });
 
+type JobRead = {
+  status: "uploaded" | "transcribing" | "analyzing" | "review" | "exporting" | "completed" | "failed";
+  stage: string;
+  progress: number;
+  error_message?: string | null;
+};
+
+type TimelineVersionRead = {
+  id: string;
+  version?: number;
+  title?: string;
+  timeline?: Segment[];
+  created_at?: string;
+};
+
+type ExportRead = {
+  id: string;
+  format: string;
+  status: JobRead["status"];
+  download_url?: string | null;
+};
+
+type PreviewRead = {
+  media_url: string;
+  duration_ms: number;
+};
+
+type UserRead = {
+  id: string;
+  email: string;
+  display_name: string;
+};
+
+type AuthRead = {
+  token: string;
+  user: UserRead;
+};
+
+const storedAuth = (): AuthRead | null => {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(AUTH_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as AuthRead) : null;
+  } catch {
+    return null;
+  }
+};
+
 export default function Studio() {
   const [mode, setMode] = useState<PlanMode>("conservative");
   const [timelines, setTimelines] = useState(demoPlans);
   const [playing, setPlaying] = useState(false);
   const [saved, setSaved] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [applying, setApplying] = useState(false);
   const [sourceFile, setSourceFile] = useState("episode-04-final.wav");
   const [mediaSrc, setMediaSrc] = useState("");
+  const [originalMediaSrc, setOriginalMediaSrc] = useState("");
   const [durationMs, setDurationMs] = useState(116800);
+  const [originalDurationMs, setOriginalDurationMs] = useState(116800);
   const [currentMs, setCurrentMs] = useState(0);
   const [projectId, setProjectId] = useState<string | null>(null);
+  const [projectAuthToken, setProjectAuthToken] = useState<string | null>(null);
   const [jobStage, setJobStage] = useState("");
+  const [exportDownloads, setExportDownloads] = useState<ExportRead[]>([]);
+  const [previewSegmentStarts, setPreviewSegmentStarts] = useState<Record<string, number>>({});
   const [uploadState, setUploadState] = useState<"ready" | "uploading" | "analyzing" | "error">("ready");
+  const [authToken, setAuthToken] = useState("");
+  const [user, setUser] = useState<UserRead | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authName, setAuthName] = useState("");
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [versions, setVersions] = useState<TimelineVersionRead[]>([]);
   const fileInput = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const localUrlRef = useRef<string | null>(null);
   const segments = timelines[mode];
+  const projectToken = projectAuthToken ?? authToken;
 
   const kept = useMemo(() => segments.filter((item) => item.action === "keep"), [segments]);
   const removedMs = useMemo(
@@ -94,6 +163,25 @@ export default function Studio() {
   }, []);
 
   useEffect(() => {
+    const auth = storedAuth();
+    if (!auth) return;
+    setAuthToken(auth.token);
+    setUser(auth.user);
+    fetch(apiUrl("/auth/me"), { headers: apiHeaders(undefined, auth.token) })
+      .then((response) => (response.ok ? response.json() : Promise.reject()))
+      .then((nextUser: UserRead) => {
+        const next = { token: auth.token, user: nextUser };
+        setUser(nextUser);
+        window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(next));
+      })
+      .catch(() => {
+        setAuthToken("");
+        setUser(null);
+        window.localStorage.removeItem(AUTH_STORAGE_KEY);
+      });
+  }, []);
+
+  useEffect(() => {
     if (!mediaSrc) {
       setPlaying(false);
       return;
@@ -107,8 +195,20 @@ export default function Studio() {
     }
   }, [playing, mediaSrc]);
 
+  const restoreOriginalPreview = () => {
+    if (originalMediaSrc && mediaSrc !== originalMediaSrc) {
+      setMediaSrc(originalMediaSrc);
+      setDurationMs(originalDurationMs);
+      setCurrentMs(0);
+      setPlaying(false);
+      setPreviewSegmentStarts({});
+      setJobStage("预览已回到原始音频，点击应用刷新剪辑预览");
+    }
+  };
+
   const update = (next: Segment[]) => {
     setSaved(false);
+    restoreOriginalPreview();
     setTimelines((current) => ({ ...current, [mode]: next }));
   };
 
@@ -134,21 +234,174 @@ export default function Studio() {
     update(next.map((item, output_order) => ({ ...item, output_order })));
   };
 
-  const runExport = () => {
+  const loadVersions = async (targetProjectId = projectId) => {
+    if (!targetProjectId) return [];
+    const response = await fetch(apiUrl(`/projects/${targetProjectId}/timeline`), { headers: apiHeaders(undefined, projectToken) });
+    if (!response.ok) return [];
+    const data = (await response.json()) as TimelineVersionRead[];
+    setVersions(data);
+    return data;
+  };
+
+  const saveCurrentTimeline = async (title = `${mode === "conservative" ? "保守版" : "重构版"}人工剪辑`) => {
+    if (!projectId) {
+      window.alert("请先上传并完成转写，再保存版本");
+      return null;
+    }
+    const response = await fetch(apiUrl(`/projects/${projectId}/timeline`), {
+      method: "PUT",
+      headers: apiHeaders({ "Content-Type": "application/json" }, projectToken),
+      body: JSON.stringify({ title, segments }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const timeline = (await response.json()) as TimelineVersionRead;
     setSaved(true);
+    await loadVersions(projectId);
+    return timeline;
+  };
+
+  const submitAuth = async () => {
+    const path = authMode === "login" ? "/auth/login" : "/auth/register";
+    const response = await fetch(apiUrl(path), {
+      method: "POST",
+      headers: apiHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        email: authEmail,
+        password: authPassword,
+        ...(authMode === "register" ? { display_name: authName } : {}),
+      }),
+    });
+    if (!response.ok) {
+      setJobStage(await response.text());
+      return;
+    }
+    const auth = (await response.json()) as AuthRead;
+    setAuthToken(auth.token);
+    setUser(auth.user);
+    window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(auth));
+    setAuthOpen(false);
+    setAuthPassword("");
+    setJobStage(`已登录：${auth.user.display_name}`);
+  };
+
+  const logout = async () => {
+    if (authToken) {
+      await fetch(apiUrl("/auth/logout"), { method: "POST", headers: apiHeaders(undefined, authToken) }).catch(() => null);
+    }
+    setAuthToken("");
+    setUser(null);
+    setAuthOpen(false);
+    setProjectId(null);
+    setProjectAuthToken(null);
+    setVersions([]);
+    setMediaSrc("");
+    setOriginalMediaSrc("");
+    setCurrentMs(0);
+    setPlaying(false);
+    window.localStorage.removeItem(AUTH_STORAGE_KEY);
+    setJobStage("已退出登录");
+  };
+
+  const runExport = async () => {
+    if (!projectId) {
+      window.alert("请先上传并完成转写，再导出剪辑结果");
+      return;
+    }
     setExporting(true);
-    window.setTimeout(() => setExporting(false), 1600);
+    setExportDownloads([]);
+    setJobStage("保存人工剪辑时间线");
+    try {
+      const timelineResponse = await fetch(apiUrl(`/projects/${projectId}/timeline`), {
+        method: "PUT",
+        headers: apiHeaders({ "Content-Type": "application/json" }, projectToken),
+        body: JSON.stringify({
+          title: `${mode === "conservative" ? "保守版" : "重构版"}人工剪辑`,
+          segments,
+        }),
+      });
+      if (!timelineResponse.ok) throw new Error(await timelineResponse.text());
+      const timeline = (await timelineResponse.json()) as TimelineVersionRead;
+      setSaved(true);
+      await loadVersions(projectId);
+      setJobStage("提交音频导出任务");
+
+      const exportResponse = await fetch(apiUrl(`/projects/${projectId}/export`), {
+        method: "POST",
+        headers: apiHeaders({ "Content-Type": "application/json" }, projectToken),
+        body: JSON.stringify({ timeline_version_id: timeline.id, formats: ["mp3", "wav"] }),
+      });
+      if (!exportResponse.ok) throw new Error(await exportResponse.text());
+      const job = (await exportResponse.json()) as { id: string };
+      await pollJob(job.id);
+
+      const exportsResponse = await fetch(apiUrl(`/projects/${projectId}/exports`), { headers: apiHeaders(undefined, projectToken) });
+      if (!exportsResponse.ok) throw new Error("读取导出文件失败");
+      const rows = ((await exportsResponse.json()) as ExportRead[]).filter((item) => item.download_url);
+      setExportDownloads(rows);
+      setJobStage("导出完成，可下载成片");
+    } catch (error) {
+      setJobStage(error instanceof Error ? error.message : "导出失败");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const previewStartsFor = (items: Segment[]) => {
+    let cursor = 0;
+    const starts: Record<string, number> = {};
+    for (const segment of [...items].filter((item) => item.action === "keep").sort((a, b) => a.output_order - b.output_order)) {
+      starts[segment.segment_id] = cursor;
+      cursor += segment.source_end - segment.source_start;
+    }
+    return starts;
+  };
+
+  const applyPreview = async () => {
+    if (!projectId) {
+      window.alert("请先上传并完成转写，再应用预览");
+      return;
+    }
+    if (!kept.length) {
+      window.alert("至少保留一个片段才能生成预览");
+      return;
+    }
+    setApplying(true);
+    setPlaying(false);
+    setJobStage("正在应用剪辑到本地预览");
+    try {
+      const response = await fetch(apiUrl(`/projects/${projectId}/preview`), {
+        method: "POST",
+        headers: apiHeaders({ "Content-Type": "application/json" }, projectToken),
+        body: JSON.stringify({
+          title: `${mode === "conservative" ? "保守版" : "重构版"}预览`,
+          segments,
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const preview = (await response.json()) as PreviewRead;
+      setMediaSrc(mediaUrl(preview.media_url, projectToken));
+      setDurationMs(preview.duration_ms);
+      setCurrentMs(0);
+      setPreviewSegmentStarts(previewStartsFor(segments));
+      setJobStage("已应用到预览播放器");
+    } catch (error) {
+      setJobStage(error instanceof Error ? error.message : "应用预览失败");
+    } finally {
+      setApplying(false);
+    }
   };
 
   const pollJob = async (jobId: string) => {
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const response = await fetch(apiUrl(`/jobs/${jobId}`), { headers: apiHeaders() });
-      if (!response.ok) return;
-      const job = await response.json();
+    for (let attempt = 0; attempt < 3600; attempt += 1) {
+      const response = await fetch(apiUrl(`/jobs/${jobId}`), { headers: apiHeaders(undefined, projectToken) });
+      if (!response.ok) throw new Error("读取任务进度失败");
+      const job = (await response.json()) as JobRead;
       setJobStage(`${job.stage} · ${job.progress}%`);
-      if (["review", "completed", "failed"].includes(job.status)) return;
-      await new Promise((resolve) => window.setTimeout(resolve, 800));
+      if (job.status === "failed") throw new Error(job.error_message || job.stage || "分析失败");
+      if (job.status === "review" || job.status === "completed") return job;
+      await new Promise((resolve) => window.setTimeout(resolve, attempt < 10 ? 800 : 2000));
     }
+    throw new Error("分析仍在运行，请稍后刷新查看进度");
   };
 
   const selectFile = async (file?: File) => {
@@ -169,47 +422,55 @@ export default function Studio() {
     localUrlRef.current = localUrl;
     setSourceFile(file.name);
     setMediaSrc(localUrl);
+    setOriginalMediaSrc(localUrl);
     setCurrentMs(0);
     setPlaying(false);
+    setPreviewSegmentStarts({});
     setUploadState("uploading");
     setJobStage("正在上传本地音频");
 
     try {
       const detectedDuration = await readDuration(localUrl);
-      if (detectedDuration) setDurationMs(detectedDuration);
+      if (detectedDuration) {
+        setDurationMs(detectedDuration);
+        setOriginalDurationMs(detectedDuration);
+      }
 
       const projectResponse = await fetch(apiUrl("/projects"), {
         method: "POST",
-        headers: apiHeaders({ "Content-Type": "application/json" }),
+        headers: apiHeaders({ "Content-Type": "application/json" }, authToken),
         body: JSON.stringify({ title: file.name.replace(/\.[^.]+$/, "") || "未命名播客" }),
       });
       if (!projectResponse.ok) throw new Error("创建项目失败");
       const project = await projectResponse.json();
       setProjectId(project.id);
+      setProjectAuthToken(authToken);
 
       const form = new FormData();
       form.append("file", file);
       const uploadResponse = await fetch(apiUrl(`/projects/${project.id}/source`), {
         method: "POST",
-        headers: apiHeaders(),
+        headers: apiHeaders(undefined, authToken),
         body: form,
       });
       if (!uploadResponse.ok) throw new Error(await uploadResponse.text());
       const upload = await uploadResponse.json();
-      setMediaSrc(mediaUrl(upload.media_url));
+      const serverMedia = mediaUrl(upload.media_url, authToken);
+      setMediaSrc(serverMedia);
+      setOriginalMediaSrc(serverMedia);
       setUploadState("analyzing");
       setJobStage("正在转写与生成剪辑提案");
 
       const processResponse = await fetch(apiUrl(`/projects/${project.id}/process`), {
         method: "POST",
-        headers: apiHeaders({ "Content-Type": "application/json" }),
+        headers: apiHeaders({ "Content-Type": "application/json" }, authToken),
         body: JSON.stringify({ object_key: upload.object_key, duration_ms: detectedDuration }),
       });
       if (!processResponse.ok) throw new Error("启动分析失败");
       const job = await processResponse.json();
       await pollJob(job.id);
 
-      const plansResponse = await fetch(apiUrl(`/projects/${project.id}/plans`), { headers: apiHeaders() });
+      const plansResponse = await fetch(apiUrl(`/projects/${project.id}/plans`), { headers: apiHeaders(undefined, authToken) });
       if (plansResponse.ok) {
         const data = await plansResponse.json();
         const next = { ...demoPlans };
@@ -220,6 +481,7 @@ export default function Studio() {
         }
         setTimelines(next);
       }
+      await loadVersions(project.id);
       setUploadState("ready");
     } catch (error) {
       setUploadState("error");
@@ -240,8 +502,11 @@ export default function Studio() {
       fileInput.current?.click();
       return;
     }
-    audioRef.current.currentTime = segment.source_start / 1000;
-    setCurrentMs(segment.source_start);
+    const previewStart = previewSegmentStarts[segment.segment_id];
+    if (Object.keys(previewSegmentStarts).length && previewStart === undefined) return;
+    const start = previewStart ?? segment.source_start;
+    audioRef.current.currentTime = start / 1000;
+    setCurrentMs(start);
     setPlaying(true);
   };
 
@@ -271,10 +536,81 @@ export default function Studio() {
           <strong>AI 落地，不从模型开始</strong>
         </div>
         <nav>
-          <button className="text-button">版本记录 <b>3</b></button>
-          <button className="avatar">林</button>
+          <button
+            className="text-button"
+            onClick={async () => {
+              await loadVersions();
+              setVersionsOpen(true);
+            }}
+          >
+            版本记录 <b>{versions.length}</b>
+          </button>
+          <button
+            className="avatar"
+            onClick={() => {
+              setAuthOpen((value) => !value);
+              setVersionsOpen(false);
+            }}
+          >
+            {(user?.display_name || user?.email || "访").slice(0, 1).toUpperCase()}
+          </button>
         </nav>
       </header>
+      {authOpen ? (
+        <div className="popover auth-popover">
+          <div className="popover-head">
+            <strong>{user ? user.display_name : authMode === "login" ? "登录" : "注册"}</strong>
+            <button onClick={() => setAuthOpen(false)}>×</button>
+          </div>
+          {user ? (
+            <>
+              <p>{user.email}</p>
+              <button className="wide-action" onClick={logout}>退出登录</button>
+            </>
+          ) : (
+            <>
+              <input value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="邮箱" />
+              <input value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="密码" type="password" />
+              {authMode === "register" ? (
+                <input value={authName} onChange={(event) => setAuthName(event.target.value)} placeholder="昵称" />
+              ) : null}
+              <button className="wide-action" onClick={submitAuth}>{authMode === "login" ? "登录" : "注册"}</button>
+              <button className="link-action" onClick={() => setAuthMode(authMode === "login" ? "register" : "login")}>
+                {authMode === "login" ? "创建新账号" : "已有账号，去登录"}
+              </button>
+            </>
+          )}
+        </div>
+      ) : null}
+      {versionsOpen ? (
+        <div className="popover versions-popover">
+          <div className="popover-head">
+            <strong>版本记录</strong>
+            <button onClick={() => setVersionsOpen(false)}>×</button>
+          </div>
+          {versions.length ? (
+            versions.map((item) => (
+              <button
+                className="version-row"
+                key={item.id}
+                onClick={() => {
+                  if (item.timeline) {
+                    restoreOriginalPreview();
+                    setTimelines((current) => ({ ...current, [mode]: item.timeline as Segment[] }));
+                    setSaved(true);
+                  }
+                  setVersionsOpen(false);
+                }}
+              >
+                <strong>版本 {item.version}</strong>
+                <span>{item.title}</span>
+              </button>
+            ))
+          ) : (
+            <p>当前项目还没有保存版本</p>
+          )}
+        </div>
+      ) : null}
 
       <section className="hero-strip">
         <div>
@@ -381,7 +717,12 @@ export default function Studio() {
             </div>
             <div className="timeline-actions">
               <span>{saved ? "已保存版本 04" : "有未保存修改"}</span>
-              <button onClick={() => setSaved(true)}>保存版本</button>
+              <button onClick={applyPreview} disabled={applying || uploadState !== "ready"}>
+                {applying ? "应用中" : "应用"}
+              </button>
+              <button onClick={() => saveCurrentTimeline().catch((error) => setJobStage(error instanceof Error ? error.message : "保存版本失败"))}>
+                保存版本
+              </button>
             </div>
           </div>
 
@@ -429,6 +770,15 @@ export default function Studio() {
           <span>{exporting ? "正在排队导出" : "确认并导出"}</span>
           <b>{exporting ? "···" : "↗"}</b>
         </button>
+        {exportDownloads.length ? (
+          <div className="download-list">
+            {exportDownloads.map((item) => (
+              <a key={item.id} href={mediaUrl(item.download_url || "", projectToken)} download>
+                下载 {item.format.toUpperCase()}
+              </a>
+            ))}
+          </div>
+        ) : null}
       </footer>
     </main>
   );

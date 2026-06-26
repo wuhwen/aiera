@@ -1,6 +1,8 @@
 import mimetypes
 import secrets
 import uuid
+import json
+from hashlib import sha256
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,21 +14,27 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
-from .models import EditPlan, Export, Job, JobStatus, Project, TimelineVersion, Transcript
+from .models import EditPlan, Export, Job, JobStatus, Project, TimelineVersion, Transcript, User
 from .schemas import (
+    AuthRead,
     ExportCreate,
     ExportRead,
     JobRead,
+    PreviewRead,
     ProcessRequest,
     ProjectCreate,
     ProjectRead,
     SourceUploadRead,
     TimelineSave,
     TimelineVersionRead,
+    UserCreate,
+    UserLogin,
+    UserRead,
     UploadSessionRead,
     UploadSessionRequest,
 )
-from .security import current_owner
+from .security import current_owner, current_user, hash_password, issue_session_token, verify_password
+from .services.exporter import render_audio_export
 from .services.timeline import validate_timeline
 from .settings import get_settings
 from .tasks import export_project, process_project
@@ -65,12 +73,27 @@ def owned_project(db: Session, project_id: str, owner_id: str) -> Project:
 
 
 def media_owner(
+    authorization: str | None = Header(default=None),
     api_key: str | None = Query(default=None),
+    session_token: str | None = Query(default=None),
     x_api_key: str | None = Header(default=None),
+    x_session_token: str | None = Header(default=None),
     x_user_id: str = Header(default="studio"),
+    db: Session = Depends(get_db),
 ) -> str:
     if settings.api_key and not secrets.compare_digest(x_api_key or api_key or "", settings.api_key):
         raise HTTPException(401, "invalid API key")
+    token = x_session_token or session_token or None
+    if authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value:
+            token = value
+    if token:
+        user = db.scalar(select(User).where(User.session_token == token))
+        if user:
+            return user.id
+        if not settings.api_key:
+            raise HTTPException(401, "invalid session")
     return x_user_id[:64]
 
 
@@ -89,11 +112,31 @@ def safe_filename(filename: str) -> str:
     return "".join(char if char.isalnum() or char in ".-_" else "_" for char in name) or "audio"
 
 
+def object_name(filename: str) -> str:
+    suffix = Path(filename).suffix.lower()
+    allowed_suffixes = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
+    return f"{uuid.uuid4()}{suffix if suffix in allowed_suffixes else ''}"
+
+
 def local_object_path(object_key: str) -> Path:
     path = (storage_root / object_key).resolve()
     if not path.is_relative_to(storage_root):
         raise HTTPException(400, "invalid object key")
     return path
+
+
+def stable_key(prefix: str, *parts: str | None) -> str:
+    raw = ":".join(part or "" for part in parts)
+    digest = sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}:{digest}"
+
+
+def timeline_duration_ms(timeline: list[dict]) -> int:
+    return sum(
+        max(0, int(item["source_end"]) - int(item["source_start"]))
+        for item in timeline
+        if item.get("action") == "keep"
+    )
 
 
 def dispatch(task, job_id: str) -> None:
@@ -106,6 +149,49 @@ def dispatch(task, job_id: str) -> None:
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "time": datetime.now(UTC).isoformat()}
+
+
+@app.post("/api/auth/register", response_model=AuthRead, status_code=201)
+def register_user(payload: UserCreate, db: Session = Depends(get_db)) -> AuthRead:
+    email = payload.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(422, "invalid email")
+    if db.scalar(select(User).where(User.email == email)):
+        raise HTTPException(409, "email already registered")
+    display_name = payload.display_name.strip() or email.split("@", 1)[0]
+    user = User(
+        email=email,
+        display_name=display_name[:80],
+        password_hash=hash_password(payload.password),
+        session_token=issue_session_token(),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return AuthRead(token=user.session_token or "", user=UserRead.model_validate(user))
+
+
+@app.post("/api/auth/login", response_model=AuthRead)
+def login_user(payload: UserLogin, db: Session = Depends(get_db)) -> AuthRead:
+    email = payload.email.strip().lower()
+    user = db.scalar(select(User).where(User.email == email))
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(401, "invalid email or password")
+    user.session_token = issue_session_token()
+    db.commit()
+    db.refresh(user)
+    return AuthRead(token=user.session_token or "", user=UserRead.model_validate(user))
+
+
+@app.get("/api/auth/me", response_model=UserRead)
+def read_me(user: User = Depends(current_user)) -> User:
+    return user
+
+
+@app.post("/api/auth/logout", status_code=204)
+def logout_user(user: User = Depends(current_user), db: Session = Depends(get_db)) -> None:
+    user.session_token = None
+    db.commit()
 
 
 @app.get("/api/projects", response_model=list[ProjectRead])
@@ -140,7 +226,7 @@ def upload_session(
     project = owned_project(db, project_id, owner_id)
     if payload.size_bytes > settings.max_upload_bytes:
         raise HTTPException(413, "file exceeds 2GB limit")
-    object_key = f"originals/{owner_id}/{project.id}/{uuid.uuid4()}-{safe_filename(payload.filename)}"
+    object_key = f"originals/{owner_id}/{project.id}/{object_name(payload.filename)}"
     project.source_filename = payload.filename
     project.source_object_key = object_key
     db.commit()
@@ -175,8 +261,8 @@ async def upload_source_audio(
     if not content_type.startswith("audio/") and suffix not in allowed_suffixes:
         raise HTTPException(415, "only audio files are supported")
 
-    filename = safe_filename(file.filename or "audio")
-    object_key = f"originals/{owner_id}/{project.id}/{uuid.uuid4()}-{filename}"
+    filename = file.filename or "audio"
+    object_key = f"originals/{owner_id}/{project.id}/{object_name(filename)}"
     target = local_object_path(object_key)
     target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -236,7 +322,7 @@ def start_process(
     if payload.object_key:
         project.source_object_key = payload.object_key
     project.duration_ms = payload.duration_ms
-    key = f"process:{project.id}:{project.source_object_key or 'demo'}"
+    key = stable_key("process", project.id, project.source_object_key or "demo")
     job = db.scalar(select(Job).where(Job.idempotency_key == key))
     if not job:
         job = Job(
@@ -336,6 +422,53 @@ def list_timelines(
     )
 
 
+@app.post("/api/projects/{project_id}/preview", response_model=PreviewRead)
+def create_preview(
+    project_id: str,
+    payload: TimelineSave,
+    db: Session = Depends(get_db),
+    owner_id: str = Depends(current_owner),
+) -> PreviewRead:
+    project = owned_project(db, project_id, owner_id)
+    if not project.source_object_key:
+        raise HTTPException(409, "source audio not uploaded")
+    transcript = db.scalar(select(Transcript).where(Transcript.project_id == project_id))
+    if not transcript:
+        raise HTTPException(409, "transcript not ready")
+    validate_timeline(payload.segments, transcript.segments)
+
+    timeline = [item.model_dump() for item in payload.segments]
+    if not any(item["action"] == "keep" for item in timeline):
+        raise HTTPException(422, "at least one segment must be kept")
+    digest = sha256(json.dumps(timeline, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    object_key = f"previews/{owner_id}/{project.id}/{digest}.mp3"
+    target = local_object_path(object_key)
+    if not target.exists():
+        render_audio_export(
+            source_path=local_object_path(project.source_object_key),
+            timeline=timeline,
+            output_path=target,
+            output_format="mp3",
+        )
+    return PreviewRead(media_url=f"/api/projects/{project.id}/preview/{digest}", duration_ms=timeline_duration_ms(timeline))
+
+
+@app.get("/api/projects/{project_id}/preview/{preview_id}")
+def stream_preview_audio(
+    project_id: str,
+    preview_id: str,
+    db: Session = Depends(get_db),
+    owner_id: str = Depends(media_owner),
+) -> FileResponse:
+    project = owned_project(db, project_id, owner_id)
+    if not preview_id.isalnum():
+        raise HTTPException(400, "invalid preview id")
+    path = local_object_path(f"previews/{owner_id}/{project.id}/{preview_id}.mp3")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "preview not found")
+    return FileResponse(path, media_type="audio/mpeg", filename=f"{project.title}-preview.mp3")
+
+
 @app.post("/api/projects/{project_id}/export", response_model=JobRead, status_code=202)
 def create_export(
     project_id: str,
@@ -392,3 +525,19 @@ def list_exports(
         )
         for row in rows
     ]
+
+
+@app.get("/api/downloads/{export_id}")
+def download_export(
+    export_id: str,
+    db: Session = Depends(get_db),
+    owner_id: str = Depends(media_owner),
+) -> FileResponse:
+    row = db.scalar(select(Export).join(Project).where(Export.id == export_id, Project.owner_id == owner_id))
+    if not row or not row.object_key:
+        raise HTTPException(404, "export not found")
+    path = local_object_path(row.object_key)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "export file not found")
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type, filename=path.name)

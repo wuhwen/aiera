@@ -3,6 +3,14 @@ x-api-env: &api-env
   REDIS_URL: redis://redis:6379/0
   API_KEY: ${API_KEY:-}
   MOCK_PROVIDERS: ${MOCK_PROVIDERS:-true}
+  ASR_PROVIDER: ${ASR_PROVIDER:-mock}
+  WHISPER_MODEL: ${WHISPER_MODEL:-small}
+  WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+  WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-int8}
+  WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-zh}
+  WHISPER_BEAM_SIZE: ${WHISPER_BEAM_SIZE:-5}
+  HF_HOME: /models/huggingface
+  HF_ENDPOINT: ${HF_ENDPOINT:-}
   CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost}
   COS_BUCKET: ${COS_BUCKET:-}
   COS_REGION: ${COS_REGION:-ap-shanghai}
@@ -38,10 +46,10 @@ services:
         NODE_IMAGE: ${NODE_IMAGE:-m.daocloud.io/docker.io/library/node:22-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
         NEXT_PUBLIC_API_URL: /api
-        NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-${API_KEY:-}}
+        NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
     environment:
       NEXT_PUBLIC_API_URL: /api
-      NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-${API_KEY:-}}
+      NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
       HOSTNAME: 0.0.0.0
     expose:
       - "3000"
@@ -61,6 +69,7 @@ services:
       <<: *api-env
     volumes:
       - media-storage:/app/storage
+      - model-cache:/models
     expose:
       - "8000"
     depends_on:
@@ -100,6 +109,7 @@ services:
     volumes:
       - worker-cache:/work
       - media-storage:/app/storage
+      - model-cache:/models
     depends_on:
       postgres:
         condition: service_healthy
@@ -156,3 +166,4 @@ volumes:
   redis-data:
   worker-cache:
   media-storage:
+  model-cache:

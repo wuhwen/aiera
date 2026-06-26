@@ -10,6 +10,29 @@ class ProjectCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
 
 
+class UserCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=6, max_length=128)
+    display_name: str = Field(default="", max_length=80)
+
+
+class UserLogin(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    email: str
+    display_name: str
+
+
+class AuthRead(BaseModel):
+    token: str
+    user: UserRead
+
+
 class ProjectRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
@@ -100,6 +123,11 @@ class TimelineVersionRead(BaseModel):
     title: str
     timeline: list[dict]
     created_at: datetime
+
+
+class PreviewRead(BaseModel):
+    media_url: str
+    duration_ms: int
 
 
 class ExportCreate(BaseModel):
