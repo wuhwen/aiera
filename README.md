@@ -30,8 +30,15 @@ Node 和 Python 依赖默认分别使用 npmmirror 与腾讯云 PyPI 镜像。
 腾讯云生产部署请仅使用基础配置：
 
 ```bash
+sudo mkdir -p /mnt/lighthouse/podcast-cut/{media,work}
 docker compose -f docker-compose.yml up -d
 ```
+
+默认情况下，上传的原始音频、预览和最终导出文件保存在宿主机
+`/mnt/lighthouse/podcast-cut/media`，FFmpeg 处理中间文件保存在
+`/mnt/lighthouse/podcast-cut/work`。可通过 `.env` 中的
+`MEDIA_STORAGE_PATH` 和 `WORKER_TEMP_PATH` 修改。部署前应确认
+`/mnt/lighthouse` 已挂载到数据盘；否则这些目录仍会占用系统盘。
 
 ## 生产前必须完成
 

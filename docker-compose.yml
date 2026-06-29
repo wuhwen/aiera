@@ -68,7 +68,7 @@ services:
     environment:
       <<: *api-env
     volumes:
-      - media-storage:/app/storage
+      - ${MEDIA_STORAGE_PATH:-/mnt/lighthouse/podcast-cut/media}:/app/storage
       - model-cache:/models
     expose:
       - "8000"
@@ -107,8 +107,8 @@ services:
       <<: *api-env
       TMPDIR: /work
     volumes:
-      - worker-cache:/work
-      - media-storage:/app/storage
+      - ${WORKER_TEMP_PATH:-/mnt/lighthouse/podcast-cut/work}:/work
+      - ${MEDIA_STORAGE_PATH:-/mnt/lighthouse/podcast-cut/media}:/app/storage
       - model-cache:/models
     depends_on:
       postgres:
@@ -164,6 +164,4 @@ services:
 volumes:
   postgres-data:
   redis-data:
-  worker-cache:
-  media-storage:
   model-cache:
